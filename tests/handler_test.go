@@ -16,7 +16,7 @@ import (
 func newGateway(t *testing.T, upstream *httptest.Server) *httptest.Server {
 	t.Helper()
 	u, _ := url.Parse(upstream.URL)
-	gw := httptest.NewServer(proxy.NewHandler(u, "upstream-secret", discardLogger()))
+	gw := httptest.NewServer(proxy.NewHandler(u, "upstream-secret", 100, 5*time.Second, discardLogger()))
 	t.Cleanup(gw.Close)
 	return gw
 }

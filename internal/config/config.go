@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -20,6 +21,7 @@ type Config struct {
 	Addr                  string
 	UpstreamURL           *url.URL
 	UpstreamAPIKey        string
+	ClientAPIKeys         map[string]bool
 	ShutdownTimeout       time.Duration
 	MaxIdleConnsPerHost   int
 	ResponseHeaderTimeout time.Duration
@@ -28,6 +30,7 @@ type Config struct {
 // Load reads configuration from the environment. Pass os.Getenv in
 // production; tests pass a fake.
 func Load(getenv func(string) string) (Config, error) {
+	var err error
 	cfg := Config{
 		Addr:           envOr(getenv, "LLMGATE_ADDR", defaultAddr),
 		UpstreamAPIKey: getenv("LLMGATE_UPSTREAM_API_KEY"),
@@ -35,6 +38,10 @@ func Load(getenv func(string) string) (Config, error) {
 
 	if cfg.UpstreamAPIKey == "" {
 		return Config{}, errors.New("LLMGATE_UPSTREAM_API_KEY is required")
+	}
+
+	if cfg.ClientAPIKeys, err = keySetEnv(getenv, "LLMGATE_CLIENT_API_KEYS"); err != nil {
+		return Config{}, err
 	}
 
 	rawURL := envOr(getenv, "LLMGATE_UPSTREAM_URL", defaultUpstreamURL)
@@ -94,4 +101,18 @@ func intEnv(getenv func(string) string, key string, fallback int) (int, error) {
 		return 0, fmt.Errorf("%s must be positive, got %d", key, n)
 	}
 	return n, nil
+}
+
+// keySetEnv parses a comma-separated list of keys into a set.
+func keySetEnv(getenv func(string) string, key string) (map[string]bool, error) {
+	set := make(map[string]bool)
+	for _, k := range strings.Split(getenv(key), ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			set[k] = true
+		}
+	}
+	if len(set) == 0 {
+		return nil, fmt.Errorf("%s is required (comma-separated client keys)", key)
+	}
+	return set, nil
 }

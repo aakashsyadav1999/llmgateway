@@ -25,18 +25,23 @@ type Handler struct {
 	logger   *slog.Logger
 }
 
-func NewHandler(upstream *url.URL, apiKey string, logger *slog.Logger) *Handler {
+func NewHandler(
+	upstream *url.URL,
+	apiKey string,
+	maxIdleConnsPerHost int,
+	responseHeaderTimeout time.Duration,
+	logger *slog.Logger,
+) *Handler {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.MaxIdleConnsPerHost = 100
-	tr.ResponseHeaderTimeout = 120 * time.Second
+
+	tr.MaxIdleConnsPerHost = maxIdleConnsPerHost
+	tr.ResponseHeaderTimeout = responseHeaderTimeout
 
 	return &Handler{
 		upstream: upstream,
 		apiKey:   apiKey,
-		// No Client.Timeout: it covers reading the body too and would
-		// cut off long streams. The transport bounds the wait for headers.
-		client: &http.Client{Transport: tr},
-		logger: logger,
+		client:   &http.Client{Transport: tr},
+		logger:   logger,
 	}
 }
 

@@ -20,6 +20,7 @@ func TestLoad_MissingAPIKey(t *testing.T) {
 func TestLoad_Defaults(t *testing.T) {
 	cfg, err := config.Load(fakeEnv(map[string]string{
 		"LLMGATE_UPSTREAM_API_KEY": "sk-test",
+		"LLMGATE_CLIENT_API_KEYS":  "sk-gateway-dev-key",
 	}))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -35,6 +36,7 @@ func TestLoad_Defaults(t *testing.T) {
 func TestLoad_BadDuration(t *testing.T) {
 	_, err := config.Load(fakeEnv(map[string]string{
 		"LLMGATE_UPSTREAM_API_KEY": "sk-test",
+		"LLMGATE_CLIENT_API_KEYS":  "sk-gateway-dev-key",
 		"LLMGATE_SHUTDOWN_TIMEOUT": "banana",
 	}))
 	if err == nil {
