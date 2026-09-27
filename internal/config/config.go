@@ -15,6 +15,9 @@ const (
 	defaultShutdownTimeout       = 10 * time.Second
 	defaultResponseHeaderTimeout = 120 * time.Second
 	defaultMaxIdleConnsPerHost   = 100
+	defaultRateLimitBurst        = 20 // requests a client can burst before waiting
+	defaultRateLimitPerSecond    = 5  // sustained requests/sec per client thereafter
+
 )
 
 type Config struct {
@@ -25,6 +28,8 @@ type Config struct {
 	ShutdownTimeout       time.Duration
 	MaxIdleConnsPerHost   int
 	ResponseHeaderTimeout time.Duration
+	RateLimitBurst        float64
+	RateLimitPerSecond    float64
 }
 
 // Load reads configuration from the environment. Pass os.Getenv in
@@ -60,6 +65,13 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 
 	if cfg.MaxIdleConnsPerHost, err = intEnv(getenv, "LLMGATE_MAX_IDLE_CONNS_PER_HOST", defaultMaxIdleConnsPerHost); err != nil {
+		return Config{}, err
+	}
+	if cfg.RateLimitBurst, err = floatEnv(getenv, "LLMGATE_RATE_LIMIT_BURST", defaultRateLimitBurst); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.RateLimitPerSecond, err = floatEnv(getenv, "LLMGATE_RATE_LIMIT_PER_SECOND", defaultRateLimitPerSecond); err != nil {
 		return Config{}, err
 	}
 
@@ -115,4 +127,19 @@ func keySetEnv(getenv func(string) string, key string) (map[string]bool, error) 
 		return nil, fmt.Errorf("%s is required (comma-separated client keys)", key)
 	}
 	return set, nil
+}
+
+func floatEnv(getenv func(string) string, key string, fallback float64) (float64, error) {
+	raw := getenv(key)
+	if raw == "" {
+		return fallback, nil
+	}
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", key, err)
+	}
+	if f <= 0 {
+		return 0, fmt.Errorf("%s must be positive, got %v", key, f)
+	}
+	return f, nil
 }

@@ -42,9 +42,7 @@ func run(logger *slog.Logger) error {
 		Handler:           newHandler(cfg, logger),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		// No WriteTimeout on purpose: streamed LLM responses can
-		// legitimately run for minutes, and WriteTimeout would cut them off.
-		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 
 	errCh := make(chan error, 1)
@@ -91,11 +89,17 @@ func newHandler(cfg config.Config, logger *slog.Logger) http.Handler {
 		logger,
 	))
 
+	limiter := middleware.NewLimiter(cfg.RateLimitBurst, cfg.RateLimitPerSecond)
+
+	var protected http.Handler = api
+	protected = middleware.RateLimit(limiter)(protected)
+	protected = middleware.Auth(cfg.ClientAPIKeys)(protected)
+
 	root := http.NewServeMux()
 	root.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	root.Handle("/", middleware.Auth(cfg.ClientAPIKeys)(api))
+	root.Handle("/", protected)
 
 	var h http.Handler = root
 	h = middleware.Logging(logger)(h)

@@ -1,9 +1,16 @@
 package middleware
 
 import (
+	"context"
 	"crypto/subtle"
 	"net/http"
 	"strings"
+)
+
+type authCtxKey int
+
+const (
+	clientKeyContextKey authCtxKey = iota
 )
 
 func keyIsValid(validKeys map[string]bool, key string) bool {
@@ -35,7 +42,8 @@ func Auth(validKeys map[string]bool) func(http.Handler) http.Handler {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
-			next.ServeHTTP(w, r)
+			ctx := context.WithValue(r.Context(), clientKeyContextKey, key)
+			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
