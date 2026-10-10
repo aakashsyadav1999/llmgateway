@@ -404,6 +404,15 @@ Limits count requests per client key, not tokens. Instances pointing to the same
 Redis share atomic refill-and-consume decisions. Without Redis, limits are local
 to each process. A cached request still consumes one rate-limit token.
 
+Redis bucket names use `ratelimit:<SHA-256-of-client-key>`, with the full digest
+encoded as 64 hexadecimal characters. The limiter stores token counts and refill
+timestamps, not raw client credentials. All instances derive the same key.
+
+When upgrading from the earlier raw-key format, buckets start fresh. Old buckets
+remain until their existing TTL expires; the upgrade does not remove credentials
+from earlier Redis backups. Upgrade all instances together to avoid old and new
+versions enforcing separate buckets for the same client.
+
 If Redis becomes unavailable, the gateway falls back to a bounded local memory
 limiter and bypasses caching. Redis operations use short timeouts and are retried
 after a cooldown. This keeps traffic flowing, but global quotas become approximate:
@@ -534,7 +543,7 @@ sum by (client) (increase(llmgate_estimated_cost_usd_total[1h]))
 - `/healthz` and `/metrics` bypass API-key authentication. Restrict metrics access at the ingress or network boundary.
 - Compose publishes only the gateway, bound to host loopback. Redis and Ollama are internal services.
 - The Redis client currently supports an address only; Redis authentication and TLS are not configurable. Use a trusted private Redis network.
-- Redis holds response bodies and limiter state. Treat its data as sensitive; limiter keys currently contain client API keys.
+- Redis holds response bodies and limiter state. Treat its data as sensitive; limiter bucket names contain client-key hashes rather than raw credentials.
 - Request bodies are limited to 1 MiB. Streams have a response-header timeout but no total lifetime deadline.
 - The container runs as UID/GID `65532:65532` in a scratch image with CA certificates and an executable healthcheck.
 - Compose allows 30 seconds for shutdown. Increase `stop_grace_period` if you increase `LLMGATE_SHUTDOWN_TIMEOUT` beyond that.

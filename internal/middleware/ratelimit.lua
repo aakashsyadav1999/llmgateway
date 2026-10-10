@@ -3,7 +3,7 @@ if #KEYS ~= 1 or #ARGV ~= 2 then
     return redis.error_reply('ERR expected one key, capacity, and refill rate')
 end
 
-local key      = KEYS[1]           -- e.g. "ratelimit:<clientKey>"
+local key      = KEYS[1]           -- "ratelimit:<SHA-256 client key digest>"
 local capacity = tonumber(ARGV[1]) -- like b.capacity
 local rate     = tonumber(ARGV[2]) -- like b.refillRate (tokens/sec)
 

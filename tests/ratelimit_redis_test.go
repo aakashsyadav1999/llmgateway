@@ -2,6 +2,7 @@ package tests
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"sync"
@@ -38,8 +39,49 @@ func redisClient(t *testing.T) *redis.Client {
 func uniqueKey(t *testing.T, rdb *redis.Client, name string) string {
 	t.Helper()
 	key := fmt.Sprintf("test-%s-%s-%d", t.Name(), name, time.Now().UnixNano())
-	t.Cleanup(func() { rdb.Del(context.Background(), "ratelimit:"+key) })
+	t.Cleanup(func() { rdb.Del(context.Background(), hashedRedisKey(key)) })
 	return key
+}
+
+func hashedRedisKey(clientKey string) string {
+	return fmt.Sprintf("ratelimit:%x", sha256.Sum256([]byte(clientKey)))
+}
+
+func TestRedisLimiter_DoesNotPersistClientKey(t *testing.T) {
+	rdb := redisClient(t)
+	clientKey := uniqueKey(t, rdb, "secret-client-key")
+	limiter := middleware.NewRedisLimiter(rdb, 2, 1)
+	if !mustAllow(t, limiter, clientKey) {
+		t.Fatal("first request should be allowed")
+	}
+	ctx := context.Background()
+	exists, err := rdb.Exists(ctx, hashedRedisKey(clientKey)).Result()
+	if err != nil || exists != 1 {
+		t.Fatalf("expected a SHA-256 bucket: exists=%d, err=%v", exists, err)
+	}
+	var cursor uint64
+	for {
+		keys, next, err := rdb.Scan(ctx, cursor, "*"+clientKey+"*", 100).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(keys) != 0 {
+			t.Fatal("raw client credential found in Redis key names")
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	fields, err := rdb.HGetAll(ctx, hashedRedisKey(clientKey)).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for field, value := range fields {
+		if field == clientKey || value == clientKey {
+			t.Fatal("raw client credential found in bucket data")
+		}
+	}
 }
 
 func mustAllow(t *testing.T, l *middleware.RedisLimiter, key string) bool {
@@ -106,7 +148,7 @@ func TestRedisLimiter_SetsTTL(t *testing.T) {
 
 	mustAllow(t, l, key)
 
-	ttl, err := rdb.TTL(context.Background(), "ratelimit:"+key).Result()
+	ttl, err := rdb.TTL(context.Background(), hashedRedisKey(key)).Result()
 	if err != nil {
 		t.Fatal(err)
 	}

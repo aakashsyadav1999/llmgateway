@@ -2,7 +2,9 @@ package middleware
 
 import (
 	"context"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"log/slog"
 	"sync/atomic"
 	"time"
@@ -35,8 +37,11 @@ func (l *RedisLimiter) Allow(clientKey string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
+	// All instances derive the same bucket without persisting the credential.
+	digest := sha256.Sum256([]byte(clientKey))
+	key := "ratelimit:" + hex.EncodeToString(digest[:])
 	res, err := rateLimitScript.Run(ctx, l.client,
-		[]string{"ratelimit:" + clientKey}, l.capacity, l.refill).Int()
+		[]string{key}, l.capacity, l.refill).Int()
 	if err != nil {
 		return false, err
 	}
