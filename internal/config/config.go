@@ -20,6 +20,11 @@ const (
 	defaultRateLimitPerSecond    = 5               // sustained requests/sec per client thereafter
 	defaultRedisRetryAfter       = 5 * time.Second // skip Redis this long after a failure
 	defaultCacheTTL              = 24 * time.Hour  // how long cached responses live
+	defaultRetryMaxAttempts      = 3               // total upstream tries per request; 1 = no retries
+	defaultRetryBaseDelay        = 250 * time.Millisecond
+	defaultRetryMaxDelay         = 4 * time.Second
+	defaultBreakerThreshold      = 5                // consecutive upstream failures that trip the breaker
+	defaultBreakerCooldown       = 30 * time.Second // how long a tripped breaker fails fast
 
 )
 
@@ -36,6 +41,11 @@ type Config struct {
 	RedisAddr             string // empty = use in-memory limiter
 	RedisRetryAfter       time.Duration
 	CacheTTL              time.Duration // 0 = caching off; needs RedisAddr
+	RetryMaxAttempts      int
+	RetryBaseDelay        time.Duration
+	RetryMaxDelay         time.Duration
+	BreakerThreshold      int
+	BreakerCooldown       time.Duration
 }
 
 // Load reads configuration from the environment. Pass os.Getenv in
@@ -91,6 +101,22 @@ func Load(getenv func(string) string) (Config, error) {
 		if cfg.CacheTTL, err = durationEnv(getenv, "LLMGATE_CACHE_TTL", defaultCacheTTL); err != nil {
 			return Config{}, err
 		}
+	}
+
+	if cfg.RetryMaxAttempts, err = intEnv(getenv, "LLMGATE_RETRY_MAX_ATTEMPTS", defaultRetryMaxAttempts); err != nil {
+		return Config{}, err
+	}
+	if cfg.RetryBaseDelay, err = durationEnv(getenv, "LLMGATE_RETRY_BASE_DELAY", defaultRetryBaseDelay); err != nil {
+		return Config{}, err
+	}
+	if cfg.RetryMaxDelay, err = durationEnv(getenv, "LLMGATE_RETRY_MAX_DELAY", defaultRetryMaxDelay); err != nil {
+		return Config{}, err
+	}
+	if cfg.BreakerThreshold, err = intEnv(getenv, "LLMGATE_BREAKER_THRESHOLD", defaultBreakerThreshold); err != nil {
+		return Config{}, err
+	}
+	if cfg.BreakerCooldown, err = durationEnv(getenv, "LLMGATE_BREAKER_COOLDOWN", defaultBreakerCooldown); err != nil {
+		return Config{}, err
 	}
 
 	return cfg, nil

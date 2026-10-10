@@ -15,6 +15,7 @@ import (
 	"github.com/aakashsyadav1999/llmgate/internal/config"
 	"github.com/aakashsyadav1999/llmgate/internal/middleware"
 	"github.com/aakashsyadav1999/llmgate/internal/proxy"
+	"github.com/aakashsyadav1999/llmgate/internal/resilience"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -97,7 +98,12 @@ func run(logger *slog.Logger) error {
 // newHandler builds the routing and middleware chain. Health checks sit
 // outside Auth so Docker/Caddy can probe without a client key.
 func newHandler(cfg config.Config, logger *slog.Logger, rdb *redis.Client) http.Handler {
-	upstream := proxy.NewHandler(cfg.UpstreamURL, cfg.UpstreamAPIKey, cfg.MaxIdleConnsPerHost, cfg.ResponseHeaderTimeout, logger)
+	upstream := proxy.NewHandler(cfg.UpstreamURL, cfg.UpstreamAPIKey,
+		cfg.MaxIdleConnsPerHost, cfg.ResponseHeaderTimeout, logger).WithResilience(
+		resilience.RetryPolicy{MaxAttempts: cfg.RetryMaxAttempts, BaseDelay: cfg.RetryBaseDelay, MaxDelay: cfg.RetryMaxDelay},
+		resilience.NewBreaker(cfg.BreakerThreshold, cfg.BreakerCooldown, func(from, to resilience.State) {
+			logger.Warn("upstream circuit breaker", "from", from.String(), "to", to.String())
+		}))
 	if rdb != nil && cfg.CacheTTL > 0 {
 		upstream.WithCache(cache.New(rdb, cfg.CacheTTL, cfg.RedisRetryAfter, logger))
 		logger.Info("response cache: redis", "ttl", cfg.CacheTTL.String())

@@ -38,6 +38,10 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.RedisRetryAfter != 5*time.Second {
 		t.Errorf("RedisRetryAfter = %v, want 5s", cfg.RedisRetryAfter)
 	}
+	if cfg.RetryMaxAttempts != 3 || cfg.BreakerThreshold != 5 || cfg.BreakerCooldown != 30*time.Second {
+		t.Errorf("resilience defaults = %d attempts, threshold %d, cooldown %v; want 3, 5, 30s",
+			cfg.RetryMaxAttempts, cfg.BreakerThreshold, cfg.BreakerCooldown)
+	}
 }
 
 func TestLoad_RedisSettings(t *testing.T) {

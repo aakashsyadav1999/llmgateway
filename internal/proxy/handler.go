@@ -7,13 +7,16 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/aakashsyadav1999/llmgate/internal/cache"
 	"github.com/aakashsyadav1999/llmgate/internal/middleware"
+	"github.com/aakashsyadav1999/llmgate/internal/resilience"
 )
 
 const maxBodyBytes = 1 << 20 // 1 MiB
@@ -27,6 +30,8 @@ type Handler struct {
 	client   *http.Client
 	logger   *slog.Logger
 	cache    *cache.Cache
+	retry    resilience.RetryPolicy
+	breaker  *resilience.Breaker
 }
 
 func NewHandler(
@@ -46,7 +51,14 @@ func NewHandler(
 		apiKey:   apiKey,
 		client:   &http.Client{Transport: tr},
 		logger:   logger,
+		retry:    resilience.RetryPolicy{MaxAttempts: 1},
 	}
+}
+
+func (h *Handler) WithResilience(p resilience.RetryPolicy, b *resilience.Breaker) *Handler {
+	h.retry = p
+	h.breaker = b
+	return h
 }
 
 // WithCache enables response caching; see package cache for what is cached.
@@ -86,30 +98,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return // served from cache
 	}
 
-	target := h.upstream.JoinPath(r.URL.Path)
-	target.RawQuery = r.URL.RawQuery
-
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), bytes.NewReader(body))
+	resp, attempts, upstreamName, err := h.send(r, body)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	// Forward the client's headers, but not the API key.
-	for _, k := range []string{"Content-Type", "Accept"} {
-		if v := r.Header.Get(k); v != "" {
-			req.Header.Set(k, v)
-		}
-	}
-	req.Header.Set("Authorization", "Bearer "+h.apiKey)
-
-	resp, err := h.client.Do(req)
-	if err != nil {
-		if r.Context().Err() != nil {
+		switch {
+		case r.Context().Err() != nil:
 			h.logger.Info("client went away before upstream", "path", r.URL.Path)
-			return
+		case errors.Is(err, errCircuitOpen):
+			h.logger.Warn("upstream circuit open, failing fast", "path", r.URL.Path)
+			secs := int((h.breaker.RetryIn() + time.Second - 1) / time.Second)
+			w.Header().Set("Retry-After", strconv.Itoa(max(1, secs)))
+			http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
+		default:
+			h.logger.Error("upstream request failed", "err", err, "path", r.URL.Path, "attempts", attempts)
+			http.Error(w, "bad gateway", http.StatusBadGateway)
 		}
-		h.logger.Error("upstream request failed", "err", err, "path", r.URL.Path)
-		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
@@ -162,8 +164,106 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"stream", streamed,
 		"status", resp.StatusCode,
 		"cache", cacheStatus,
+		"attempts", attempts,
+		"upstream", upstreamName,
 		"duration", time.Since(start),
 	)
+}
+
+var errCircuitOpen = errors.New("upstream circuit open")
+
+// send calls the upstream, retrying transient failures. Retrying is safe
+// here because nothing has been written to the client yet. The caller
+// closes the returned response's body.
+func (h *Handler) send(r *http.Request, body []byte) (*http.Response, int, string, error) {
+	for attempt := 1; ; attempt++ {
+		if err := r.Context().Err(); err != nil {
+			return nil, attempt - 1, "", err
+		}
+
+		if h.breaker != nil && !h.breaker.Allow() {
+			return nil, attempt - 1, "default", errCircuitOpen
+		}
+		resp, err := h.do(r, body)
+		if h.breaker != nil {
+			h.breaker.Record(outcome(r, resp, err))
+		}
+
+		if attempt >= h.retry.MaxAttempts || !retryable(r, resp, err) {
+			return resp, attempt, "default", err
+		}
+		retryAfter := ""
+		if resp != nil {
+			retryAfter = resp.Header.Get("Retry-After")
+		}
+		wait, ok := h.retry.Wait(attempt, retryAfter)
+		if !ok {
+			return resp, attempt, "default", err // upstream wants a longer pause than we'll hold the client for
+		}
+
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10)) // lets the connection be reused
+			resp.Body.Close()
+		}
+		h.logger.Warn("retrying upstream",
+			"path", r.URL.Path, "upstream", "default", "attempt", attempt, "status", status, "err", err, "wait", wait)
+
+		t := time.NewTimer(wait)
+		select {
+		case <-t.C:
+		case <-r.Context().Done():
+			t.Stop()
+			return nil, attempt, "default", r.Context().Err()
+		}
+	}
+}
+
+// do makes one upstream attempt. The request is rebuilt each time because
+// a body reader can only be consumed once.
+func (h *Handler) do(r *http.Request, body []byte) (*http.Response, error) {
+	target := h.upstream.JoinPath(r.URL.Path)
+	target.RawQuery = r.URL.RawQuery
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	// Forward the client's headers, but not the API key.
+	for _, k := range []string{"Content-Type", "Accept"} {
+		if v := r.Header.Get(k); v != "" {
+			req.Header.Set(k, v)
+		}
+	}
+	req.Header.Set("Authorization", "Bearer "+h.apiKey)
+	return h.client.Do(req)
+}
+
+// outcome classifies an attempt for the circuit breaker. Any answer below
+// 500 (including 429) means the upstream is alive.
+func outcome(r *http.Request, resp *http.Response, err error) resilience.Outcome {
+	switch {
+	case r.Context().Err() != nil:
+		return resilience.Neutral
+	case err != nil || resp.StatusCode >= 500:
+		return resilience.Failure
+	default:
+		return resilience.Success
+	}
+}
+
+// retryable reports whether an attempt is worth repeating. Timeouts are
+// not: the upstream may still be generating (and billing for) the answer,
+// and each one has already cost the client ResponseHeaderTimeout.
+func retryable(r *http.Request, resp *http.Response, err error) bool {
+	if r.Context().Err() != nil {
+		return false
+	}
+	if err != nil {
+		var ne net.Error
+		return !(errors.As(err, &ne) && ne.Timeout())
+	}
+	return resilience.RetryableStatus(resp.StatusCode)
 }
 
 // lookupCache serves the request from cache when possible. It returns the
