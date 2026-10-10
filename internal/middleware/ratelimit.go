@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/aakashsyadav1999/llmgate/internal/observability"
 )
 
 type bucket struct {
@@ -32,11 +34,15 @@ type RateLimiter interface {
 }
 
 func RateLimit(limiter RateLimiter) func(http.Handler) http.Handler {
+	return RateLimitWithMetrics(limiter, nil)
+}
+
+func RateLimitWithMetrics(limiter RateLimiter, metrics *observability.Metrics) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			key := ClientKeyFromContext(r.Context())
 			if !limiter.Allow(key) {
-				w.Header().Set("X-RateLimit-Limit", "1")
+				metrics.Reject(key)
 				http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 				return
 			}

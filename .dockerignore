@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+.aws
+.codex
+.agents
+llmgate
+tests
+README.md
+*.log

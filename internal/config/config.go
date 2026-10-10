@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aakashsyadav1999/llmgate/internal/usage"
 )
 
 type Upstream struct {
@@ -37,6 +39,7 @@ const (
 )
 
 type Config struct {
+	ModelPrices           map[string]map[string]usage.Price
 	Upstreams             []Upstream
 	Addr                  string
 	UpstreamURL           *url.URL
@@ -124,6 +127,39 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 
+	if raw := getenv("LLMGATE_MODEL_PRICES"); raw != "" {
+		decoder := json.NewDecoder(strings.NewReader(raw))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&cfg.ModelPrices); err != nil {
+			return Config{}, fmt.Errorf("LLMGATE_MODEL_PRICES: %w", err)
+		}
+		if err := decoder.Decode(new(any)); err != io.EOF {
+			return Config{}, errors.New("LLMGATE_MODEL_PRICES must contain one JSON object")
+		}
+		for name, models := range cfg.ModelPrices {
+			known := name == "*"
+			for _, u := range cfg.Upstreams {
+				known = known || name == u.Name
+			}
+			if !known {
+				return Config{}, fmt.Errorf("LLMGATE_MODEL_PRICES: unknown upstream %q", name)
+			}
+			for model, p := range models {
+				if strings.TrimSpace(model) == "" {
+					return Config{}, errors.New("LLMGATE_MODEL_PRICES: empty model")
+				}
+				values := []float64{p.Input, p.Output}
+				if p.CachedInput != nil {
+					values = append(values, *p.CachedInput)
+				}
+				for _, v := range values {
+					if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+						return Config{}, errors.New("LLMGATE_MODEL_PRICES: prices must be finite and nonnegative")
+					}
+				}
+			}
+		}
+	}
 	return cfg, nil
 }
 

@@ -1,0 +1,51 @@
+services:
+  gateway:
+    build: .
+    image: llmgate:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${LLMGATE_PORT:-8080}:8080"
+    environment:
+      LLMGATE_ADDR: ":8080"
+      LLMGATE_UPSTREAM_URL: ${LLMGATE_UPSTREAM_URL:-https://api.openai.com}
+      LLMGATE_UPSTREAM_API_KEY: ${LLMGATE_UPSTREAM_API_KEY:-}
+      LLMGATE_UPSTREAMS: ${LLMGATE_UPSTREAMS:-}
+      LLMGATE_CLIENT_API_KEYS: ${LLMGATE_CLIENT_API_KEYS:-}
+      LLMGATE_MODEL_PRICES: ${LLMGATE_MODEL_PRICES:-}
+      LLMGATE_REDIS_ADDR: redis:6379
+      LLMGATE_RATE_LIMIT_BURST: ${LLMGATE_RATE_LIMIT_BURST:-20}
+      LLMGATE_RATE_LIMIT_PER_SECOND: ${LLMGATE_RATE_LIMIT_PER_SECOND:-5}
+      LLMGATE_REDIS_RETRY_AFTER: ${LLMGATE_REDIS_RETRY_AFTER:-5s}
+      LLMGATE_CACHE_TTL: ${LLMGATE_CACHE_TTL:-24h}
+      LLMGATE_RETRY_MAX_ATTEMPTS: ${LLMGATE_RETRY_MAX_ATTEMPTS:-3}
+      LLMGATE_RETRY_BASE_DELAY: ${LLMGATE_RETRY_BASE_DELAY:-250ms}
+      LLMGATE_RETRY_MAX_DELAY: ${LLMGATE_RETRY_MAX_DELAY:-4s}
+      LLMGATE_BREAKER_THRESHOLD: ${LLMGATE_BREAKER_THRESHOLD:-5}
+      LLMGATE_BREAKER_COOLDOWN: ${LLMGATE_BREAKER_COOLDOWN:-30s}
+      LLMGATE_SHUTDOWN_TIMEOUT: ${LLMGATE_SHUTDOWN_TIMEOUT:-10s}
+      LLMGATE_RESPONSE_HEADER_TIMEOUT: ${LLMGATE_RESPONSE_HEADER_TIMEOUT:-120s}
+      LLMGATE_MAX_IDLE_CONNS_PER_HOST: ${LLMGATE_MAX_IDLE_CONNS_PER_HOST:-100}
+    depends_on:
+      redis:
+        condition: service_healthy
+    stop_grace_period: 30s
+  redis:
+    image: redis:8.6-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+  ollama:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    profiles: ["ollama"]
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+volumes:
+  redis-data:
+  ollama-data:

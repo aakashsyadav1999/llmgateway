@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,12 +15,20 @@ import (
 	"github.com/aakashsyadav1999/llmgate/internal/cache"
 	"github.com/aakashsyadav1999/llmgate/internal/config"
 	"github.com/aakashsyadav1999/llmgate/internal/middleware"
+	"github.com/aakashsyadav1999/llmgate/internal/observability"
 	"github.com/aakashsyadav1999/llmgate/internal/proxy"
 	"github.com/aakashsyadav1999/llmgate/internal/resilience"
 	"github.com/redis/go-redis/v9"
 )
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+		if err := healthcheck(os.Getenv("LLMGATE_ADDR")); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
@@ -98,6 +107,7 @@ func run(logger *slog.Logger) error {
 // newHandler builds the routing and middleware chain. Health checks sit
 // outside Auth so Docker/Caddy can probe without a client key.
 func newHandler(cfg config.Config, logger *slog.Logger, rdb *redis.Client) http.Handler {
+	metrics := observability.New(cfg.ClientAPIKeys, cfg.ModelPrices)
 	upstreams := make([]proxy.Upstream, 0, len(cfg.Upstreams))
 	for _, upstream := range cfg.Upstreams {
 		name := upstream.Name
@@ -120,6 +130,7 @@ func newHandler(cfg config.Config, logger *slog.Logger, rdb *redis.Client) http.
 			MaxDelay:    cfg.RetryMaxDelay,
 		},
 	)
+	upstream.WithMetrics(metrics)
 	if rdb != nil && cfg.CacheTTL > 0 {
 		upstream.WithCache(cache.New(rdb, cfg.CacheTTL, cfg.RedisRetryAfter, logger))
 		logger.Info("response cache: redis", "ttl", cfg.CacheTTL.String())
@@ -144,7 +155,7 @@ func newHandler(cfg config.Config, logger *slog.Logger, rdb *redis.Client) http.
 	}
 
 	var protected http.Handler = api
-	protected = middleware.RateLimit(limiter)(protected)
+	protected = middleware.RateLimitWithMetrics(limiter, metrics)(protected)
 	protected = middleware.Auth(cfg.ClientAPIKeys)(protected)
 
 	root := http.NewServeMux()
@@ -152,9 +163,34 @@ func newHandler(cfg config.Config, logger *slog.Logger, rdb *redis.Client) http.
 		w.WriteHeader(http.StatusOK)
 	})
 	root.Handle("/", protected)
+	root.Handle("GET /metrics", metrics.Handler())
 
 	var h http.Handler = root
+	h = metrics.Middleware(h)
 	h = middleware.Logging(logger)(h)
 	h = middleware.RequestID(h)
 	return h
+}
+
+func healthcheck(addr string) error {
+	if addr == "" {
+		addr = ":8080"
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return err
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + net.JoinHostPort(host, port) + "/healthz")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("healthcheck: HTTP %d", resp.StatusCode)
+	}
+	return nil
 }

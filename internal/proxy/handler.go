@@ -16,7 +16,9 @@ import (
 
 	"github.com/aakashsyadav1999/llmgate/internal/cache"
 	"github.com/aakashsyadav1999/llmgate/internal/middleware"
+	"github.com/aakashsyadav1999/llmgate/internal/observability"
 	"github.com/aakashsyadav1999/llmgate/internal/resilience"
+	"github.com/aakashsyadav1999/llmgate/internal/usage"
 )
 
 const maxBodyBytes = 1 << 20 // 1 MiB
@@ -25,11 +27,12 @@ const maxBodyBytes = 1 << 20 // 1 MiB
 // (SSE) responses through to the client as they arrive.
 
 type Handler struct {
-	pool   *upstreamPool
-	client *http.Client
-	logger *slog.Logger
-	cache  *cache.Cache // nil = caching off
-	retry  resilience.RetryPolicy
+	metrics *observability.Metrics
+	pool    *upstreamPool
+	client  *http.Client
+	logger  *slog.Logger
+	cache   *cache.Cache // nil = caching off
+	retry   resilience.RetryPolicy
 }
 
 func NewHandler(
@@ -84,6 +87,8 @@ func (h *Handler) WithCache(c *cache.Cache) *Handler {
 	return h
 }
 
+func (h *Handler) WithMetrics(m *observability.Metrics) *Handler { h.metrics = m; return h }
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
@@ -111,6 +116,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cacheKey, cacheStatus := h.lookupCache(w, r, body, meta.Model)
+	h.metrics.Cache(cacheStatus)
 	if cacheStatus == "hit" {
 		return // served from cache
 	}
@@ -151,6 +157,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rec = &recorder{}
 		src = io.TeeReader(src, rec)
 	}
+	var observed *usage.Observer
+	if resp.StatusCode == http.StatusOK && h.metrics != nil {
+		observed = &usage.Observer{Stream: streamed}
+		src = io.TeeReader(src, observed)
+	}
 
 	if streamed {
 		err = pipeFlushing(w, src)
@@ -163,6 +174,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			h.logger.Error("copying response failed", "err", err, "path", r.URL.Path)
 		}
+	}
+
+	if observed != nil {
+		observed.Finish()
+		model := meta.Model
+		if model == "" {
+			model = observed.Model
+		}
+		h.metrics.Account(middleware.ClientKeyFromContext(r.Context()), upstreamName, model, observed)
 	}
 
 	// Only store responses that arrived whole: an error or client hang-up
