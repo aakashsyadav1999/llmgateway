@@ -19,6 +19,7 @@ const (
 	defaultRateLimitBurst        = 20              // requests a client can burst before waiting
 	defaultRateLimitPerSecond    = 5               // sustained requests/sec per client thereafter
 	defaultRedisRetryAfter       = 5 * time.Second // skip Redis this long after a failure
+	defaultCacheTTL              = 24 * time.Hour  // how long cached responses live
 
 )
 
@@ -34,6 +35,7 @@ type Config struct {
 	RateLimitPerSecond    float64
 	RedisAddr             string // empty = use in-memory limiter
 	RedisRetryAfter       time.Duration
+	CacheTTL              time.Duration // 0 = caching off; needs RedisAddr
 }
 
 // Load reads configuration from the environment. Pass os.Getenv in
@@ -82,6 +84,13 @@ func Load(getenv func(string) string) (Config, error) {
 
 	if cfg.RedisRetryAfter, err = durationEnv(getenv, "LLMGATE_REDIS_RETRY_AFTER", defaultRedisRetryAfter); err != nil {
 		return Config{}, err
+	}
+
+	// "0" turns caching off, which durationEnv would reject as non-positive.
+	if raw := getenv("LLMGATE_CACHE_TTL"); raw != "0" && raw != "0s" {
+		if cfg.CacheTTL, err = durationEnv(getenv, "LLMGATE_CACHE_TTL", defaultCacheTTL); err != nil {
+			return Config{}, err
+		}
 	}
 
 	return cfg, nil
