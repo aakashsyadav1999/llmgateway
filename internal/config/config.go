@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
@@ -15,8 +16,9 @@ const (
 	defaultShutdownTimeout       = 10 * time.Second
 	defaultResponseHeaderTimeout = 120 * time.Second
 	defaultMaxIdleConnsPerHost   = 100
-	defaultRateLimitBurst        = 20 // requests a client can burst before waiting
-	defaultRateLimitPerSecond    = 5  // sustained requests/sec per client thereafter
+	defaultRateLimitBurst        = 20              // requests a client can burst before waiting
+	defaultRateLimitPerSecond    = 5               // sustained requests/sec per client thereafter
+	defaultRedisRetryAfter       = 5 * time.Second // skip Redis this long after a failure
 
 )
 
@@ -30,6 +32,8 @@ type Config struct {
 	ResponseHeaderTimeout time.Duration
 	RateLimitBurst        float64
 	RateLimitPerSecond    float64
+	RedisAddr             string // empty = use in-memory limiter
+	RedisRetryAfter       time.Duration
 }
 
 // Load reads configuration from the environment. Pass os.Getenv in
@@ -39,6 +43,7 @@ func Load(getenv func(string) string) (Config, error) {
 	cfg := Config{
 		Addr:           envOr(getenv, "LLMGATE_ADDR", defaultAddr),
 		UpstreamAPIKey: getenv("LLMGATE_UPSTREAM_API_KEY"),
+		RedisAddr:      getenv("LLMGATE_REDIS_ADDR"),
 	}
 
 	if cfg.UpstreamAPIKey == "" {
@@ -72,6 +77,10 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 
 	if cfg.RateLimitPerSecond, err = floatEnv(getenv, "LLMGATE_RATE_LIMIT_PER_SECOND", defaultRateLimitPerSecond); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.RedisRetryAfter, err = durationEnv(getenv, "LLMGATE_REDIS_RETRY_AFTER", defaultRedisRetryAfter); err != nil {
 		return Config{}, err
 	}
 
@@ -138,7 +147,7 @@ func floatEnv(getenv func(string) string, key string, fallback float64) (float64
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", key, err)
 	}
-	if f <= 0 {
+	if f <= 0 || math.IsNaN(f) || math.IsInf(f, 0) {
 		return 0, fmt.Errorf("%s must be positive, got %v", key, f)
 	}
 	return f, nil

@@ -1,11 +1,15 @@
 package tests
 
 import (
+	"io"
+	"log/slog"
+	"net"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/aakashsyadav1999/llmgate/internal/middleware"
+	"github.com/redis/go-redis/v9"
 )
 
 func TestLimiter_AllowsBurstUpToCapacity(t *testing.T) {
@@ -67,4 +71,62 @@ func TestLimiter_ConcurrentAccessIsSafe(t *testing.T) {
 		}()
 	}
 	wg.Wait() // if this panics or -race flags it, the locking is broken
+}
+
+func newFallback(t *testing.T, redisAddr string, capacity float64) *middleware.FallbackLimiter {
+	t.Helper()
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, ContextTimeoutEnabled: true, MaxRetries: -1})
+	t.Cleanup(func() { rdb.Close() })
+	return middleware.NewFallbackLimiter(
+		middleware.NewRedisLimiter(rdb, capacity, 0.001),
+		middleware.NewLimiter(capacity, 0.001),
+		time.Minute,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+}
+
+func TestFallbackLimiter_StillLimitsWhenRedisDown(t *testing.T) {
+	// Port 1 refuses connections: Redis "stopped".
+	l := newFallback(t, "127.0.0.1:1", 2)
+
+	if !l.Allow("client-a") || !l.Allow("client-a") {
+		t.Fatal("first 2 requests should be allowed by the in-memory fallback")
+	}
+	if l.Allow("client-a") {
+		t.Error("3rd request should be rejected: fallback must enforce the limit, not fail open")
+	}
+}
+
+func TestFallbackLimiter_SkipsHungRedis(t *testing.T) {
+	// Accepts connections but never replies: Redis "hung".
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { c.Close() })
+		}
+	}()
+
+	l := newFallback(t, ln.Addr().String(), 100)
+
+	start := time.Now()
+	l.Allow("client-a") // pays the timeout once, then marks Redis down
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("first request took %v; the 100ms Redis timeout isn't being applied", d)
+	}
+
+	start = time.Now()
+	for i := 0; i < 10; i++ {
+		l.Allow("client-a")
+	}
+	if d := time.Since(start); d > 50*time.Millisecond {
+		t.Errorf("10 requests took %v; Redis should be skipped during the retry window", d)
+	}
 }
