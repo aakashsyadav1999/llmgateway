@@ -25,18 +25,27 @@ const maxBodyBytes = 1 << 20 // 1 MiB
 // (SSE) responses through to the client as they arrive.
 
 type Handler struct {
-	upstream *url.URL
-	apiKey   string
-	client   *http.Client
-	logger   *slog.Logger
-	cache    *cache.Cache
-	retry    resilience.RetryPolicy
-	breaker  *resilience.Breaker
+	pool   *upstreamPool
+	client *http.Client
+	logger *slog.Logger
+	cache  *cache.Cache // nil = caching off
+	retry  resilience.RetryPolicy
 }
 
 func NewHandler(
 	upstream *url.URL,
 	apiKey string,
+	maxIdleConnsPerHost int,
+	responseHeaderTimeout time.Duration,
+	logger *slog.Logger,
+) *Handler {
+	return NewPoolHandler([]Upstream{{Name: "default", URL: upstream, APIKey: apiKey}},
+		maxIdleConnsPerHost, responseHeaderTimeout, logger)
+}
+
+// NewPoolHandler balances requests across the provided compatible upstreams.
+func NewPoolHandler(
+	upstreams []Upstream,
 	maxIdleConnsPerHost int,
 	responseHeaderTimeout time.Duration,
 	logger *slog.Logger,
@@ -47,17 +56,25 @@ func NewHandler(
 	tr.ResponseHeaderTimeout = responseHeaderTimeout
 
 	return &Handler{
-		upstream: upstream,
-		apiKey:   apiKey,
-		client:   &http.Client{Transport: tr},
-		logger:   logger,
-		retry:    resilience.RetryPolicy{MaxAttempts: 1},
+		pool:   newUpstreamPool(upstreams),
+		client: &http.Client{Transport: tr},
+		logger: logger,
+		retry:  resilience.RetryPolicy{MaxAttempts: 1},
 	}
 }
 
+// WithResilience configures a single-upstream handler before it starts serving.
+// Pools receive individual breakers through Upstream and use WithRetryPolicy.
 func (h *Handler) WithResilience(p resilience.RetryPolicy, b *resilience.Breaker) *Handler {
+	if len(h.pool.upstreams) != 1 {
+		panic("proxy: WithResilience requires a single upstream")
+	}
+	h.pool.upstreams[0].Breaker = b
+	return h.WithRetryPolicy(p)
+}
+
+func (h *Handler) WithRetryPolicy(p resilience.RetryPolicy) *Handler {
 	h.retry = p
-	h.breaker = b
 	return h
 }
 
@@ -105,7 +122,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.logger.Info("client went away before upstream", "path", r.URL.Path)
 		case errors.Is(err, errCircuitOpen):
 			h.logger.Warn("upstream circuit open, failing fast", "path", r.URL.Path)
-			secs := int((h.breaker.RetryIn() + time.Second - 1) / time.Second)
+			secs := int((h.pool.retryIn() + time.Second - 1) / time.Second)
 			w.Header().Set("Retry-After", strconv.Itoa(max(1, secs)))
 			http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
 		default:
@@ -180,17 +197,18 @@ func (h *Handler) send(r *http.Request, body []byte) (*http.Response, int, strin
 		if err := r.Context().Err(); err != nil {
 			return nil, attempt - 1, "", err
 		}
-
-		if h.breaker != nil && !h.breaker.Allow() {
-			return nil, attempt - 1, "default", errCircuitOpen
+		upstream := h.pool.acquire()
+		if upstream == nil {
+			return nil, attempt - 1, "", errCircuitOpen
 		}
-		resp, err := h.do(r, body)
-		if h.breaker != nil {
-			h.breaker.Record(outcome(r, resp, err))
+
+		resp, err := h.do(r, upstream, body)
+		if upstream.Breaker != nil {
+			upstream.Breaker.Record(outcome(r, resp, err))
 		}
 
 		if attempt >= h.retry.MaxAttempts || !retryable(r, resp, err) {
-			return resp, attempt, "default", err
+			return resp, attempt, upstream.Name, err
 		}
 		retryAfter := ""
 		if resp != nil {
@@ -198,7 +216,7 @@ func (h *Handler) send(r *http.Request, body []byte) (*http.Response, int, strin
 		}
 		wait, ok := h.retry.Wait(attempt, retryAfter)
 		if !ok {
-			return resp, attempt, "default", err // upstream wants a longer pause than we'll hold the client for
+			return resp, attempt, upstream.Name, err // upstream wants a longer pause than we'll hold the client for
 		}
 
 		status := 0
@@ -208,22 +226,22 @@ func (h *Handler) send(r *http.Request, body []byte) (*http.Response, int, strin
 			resp.Body.Close()
 		}
 		h.logger.Warn("retrying upstream",
-			"path", r.URL.Path, "upstream", "default", "attempt", attempt, "status", status, "err", err, "wait", wait)
+			"path", r.URL.Path, "upstream", upstream.Name, "attempt", attempt, "status", status, "err", err, "wait", wait)
 
 		t := time.NewTimer(wait)
 		select {
 		case <-t.C:
 		case <-r.Context().Done():
 			t.Stop()
-			return nil, attempt, "default", r.Context().Err()
+			return nil, attempt, upstream.Name, r.Context().Err()
 		}
 	}
 }
 
 // do makes one upstream attempt. The request is rebuilt each time because
 // a body reader can only be consumed once.
-func (h *Handler) do(r *http.Request, body []byte) (*http.Response, error) {
-	target := h.upstream.JoinPath(r.URL.Path)
+func (h *Handler) do(r *http.Request, upstream *Upstream, body []byte) (*http.Response, error) {
+	target := upstream.URL.JoinPath(r.URL.Path)
 	target.RawQuery = r.URL.RawQuery
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), bytes.NewReader(body))
 	if err != nil {
@@ -235,7 +253,7 @@ func (h *Handler) do(r *http.Request, body []byte) (*http.Response, error) {
 			req.Header.Set(k, v)
 		}
 	}
-	req.Header.Set("Authorization", "Bearer "+h.apiKey)
+	req.Header.Set("Authorization", "Bearer "+upstream.APIKey)
 	return h.client.Do(req)
 }
 
@@ -276,6 +294,9 @@ func (h *Handler) lookupCache(w http.ResponseWriter, r *http.Request, body []byt
 	start := time.Now()
 
 	key, ok := cache.Key(middleware.ClientKeyFromContext(r.Context()), r.Method, r.URL.Path, body)
+	if ok {
+		key = "pool:" + h.pool.scope + ":" + key
+	}
 	cc := r.Header.Get("Cache-Control")
 
 	status := "bypass"

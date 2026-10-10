@@ -65,7 +65,7 @@ func run(logger *slog.Logger) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("server starting", "addr", cfg.Addr, "upstream", cfg.UpstreamURL.String())
+		logger.Info("server starting", "addr", cfg.Addr, "upstreams", len(cfg.Upstreams))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
@@ -98,12 +98,28 @@ func run(logger *slog.Logger) error {
 // newHandler builds the routing and middleware chain. Health checks sit
 // outside Auth so Docker/Caddy can probe without a client key.
 func newHandler(cfg config.Config, logger *slog.Logger, rdb *redis.Client) http.Handler {
-	upstream := proxy.NewHandler(cfg.UpstreamURL, cfg.UpstreamAPIKey,
-		cfg.MaxIdleConnsPerHost, cfg.ResponseHeaderTimeout, logger).WithResilience(
-		resilience.RetryPolicy{MaxAttempts: cfg.RetryMaxAttempts, BaseDelay: cfg.RetryBaseDelay, MaxDelay: cfg.RetryMaxDelay},
-		resilience.NewBreaker(cfg.BreakerThreshold, cfg.BreakerCooldown, func(from, to resilience.State) {
-			logger.Warn("upstream circuit breaker", "from", from.String(), "to", to.String())
-		}))
+	upstreams := make([]proxy.Upstream, 0, len(cfg.Upstreams))
+	for _, upstream := range cfg.Upstreams {
+		name := upstream.Name
+		upstreams = append(upstreams, proxy.Upstream{
+			Name: name, URL: upstream.URL, APIKey: upstream.APIKey,
+			Breaker: resilience.NewBreaker(cfg.BreakerThreshold, cfg.BreakerCooldown, func(from, to resilience.State) {
+				logger.Warn("upstream circuit breaker", "upstream", name, "from", from.String(), "to", to.String())
+			}),
+		})
+	}
+	upstream := proxy.NewPoolHandler(
+		upstreams,
+		cfg.MaxIdleConnsPerHost,
+		cfg.ResponseHeaderTimeout,
+		logger,
+	).WithRetryPolicy(
+		resilience.RetryPolicy{
+			MaxAttempts: cfg.RetryMaxAttempts,
+			BaseDelay:   cfg.RetryBaseDelay,
+			MaxDelay:    cfg.RetryMaxDelay,
+		},
+	)
 	if rdb != nil && cfg.CacheTTL > 0 {
 		upstream.WithCache(cache.New(rdb, cfg.CacheTTL, cfg.RedisRetryAfter, logger))
 		logger.Info("response cache: redis", "ttl", cfg.CacheTTL.String())

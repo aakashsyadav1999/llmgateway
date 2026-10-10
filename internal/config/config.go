@@ -1,14 +1,22 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 )
+
+type Upstream struct {
+	Name   string
+	URL    *url.URL
+	APIKey string
+}
 
 const (
 	defaultAddr                  = ":8080"
@@ -29,6 +37,7 @@ const (
 )
 
 type Config struct {
+	Upstreams             []Upstream
 	Addr                  string
 	UpstreamURL           *url.URL
 	UpstreamAPIKey        string
@@ -58,20 +67,16 @@ func Load(getenv func(string) string) (Config, error) {
 		RedisAddr:      getenv("LLMGATE_REDIS_ADDR"),
 	}
 
-	if cfg.UpstreamAPIKey == "" {
-		return Config{}, errors.New("LLMGATE_UPSTREAM_API_KEY is required")
+	if cfg.Upstreams, err = upstreamsEnv(getenv); err != nil {
+		return Config{}, err
 	}
+	// Preserve the legacy fields for callers using the single-upstream config.
+	cfg.UpstreamURL = cfg.Upstreams[0].URL
+	cfg.UpstreamAPIKey = cfg.Upstreams[0].APIKey
 
 	if cfg.ClientAPIKeys, err = keySetEnv(getenv, "LLMGATE_CLIENT_API_KEYS"); err != nil {
 		return Config{}, err
 	}
-
-	rawURL := envOr(getenv, "LLMGATE_UPSTREAM_URL", defaultUpstreamURL)
-	u, err := url.Parse(rawURL)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return Config{}, fmt.Errorf("LLMGATE_UPSTREAM_URL %q is not a valid http(s) URL", rawURL)
-	}
-	cfg.UpstreamURL = u
 
 	if cfg.ShutdownTimeout, err = durationEnv(getenv, "LLMGATE_SHUTDOWN_TIMEOUT", defaultShutdownTimeout); err != nil {
 		return Config{}, err
@@ -120,6 +125,70 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// LLMGATE_UPSTREAMS overrides the legacy URL/key pair when provided.
+func upstreamsEnv(getenv func(string) string) ([]Upstream, error) {
+	raw := getenv("LLMGATE_UPSTREAMS")
+	if raw == "" {
+		key := getenv("LLMGATE_UPSTREAM_API_KEY")
+		if strings.TrimSpace(key) == "" {
+			return nil, errors.New("LLMGATE_UPSTREAM_API_KEY is required")
+		}
+		u, err := upstreamURL(envOr(getenv, "LLMGATE_UPSTREAM_URL", defaultUpstreamURL))
+		if err != nil {
+			return nil, errors.New("LLMGATE_UPSTREAM_URL must be an http(s) base URL without credentials, query, or fragment")
+		}
+		return []Upstream{{Name: "default", URL: u, APIKey: key}}, nil
+	}
+
+	var entries []struct {
+		Name   string `json:"name"`
+		URL    string `json:"url"`
+		APIKey string `json:"api_key"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&entries); err != nil {
+		return nil, fmt.Errorf("LLMGATE_UPSTREAMS: %w", err)
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return nil, errors.New("LLMGATE_UPSTREAMS must contain a single JSON array")
+	}
+	if len(entries) == 0 {
+		return nil, errors.New("LLMGATE_UPSTREAMS must contain at least one upstream")
+	}
+
+	upstreams := make([]Upstream, 0, len(entries))
+	names := make(map[string]bool, len(entries))
+	for i, entry := range entries {
+		name := strings.TrimSpace(entry.Name)
+		if name == "" {
+			name = fmt.Sprintf("upstream-%d", i+1)
+		}
+		if names[name] {
+			return nil, fmt.Errorf("LLMGATE_UPSTREAMS entry %d has a duplicate name", i+1)
+		}
+		names[name] = true
+		u, err := upstreamURL(entry.URL)
+		if err != nil {
+			return nil, fmt.Errorf("LLMGATE_UPSTREAMS entry %d has an invalid base URL", i+1)
+		}
+		if strings.TrimSpace(entry.APIKey) == "" {
+			return nil, fmt.Errorf("LLMGATE_UPSTREAMS entry %d requires api_key", i+1)
+		}
+		upstreams = append(upstreams, Upstream{Name: name, URL: u, APIKey: entry.APIKey})
+	}
+	return upstreams, nil
+}
+
+func upstreamURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") ||
+		u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return nil, errors.New("invalid upstream URL")
+	}
+	return u, nil
 }
 
 func envOr(getenv func(string) string, key, fallback string) string {
