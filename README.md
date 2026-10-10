@@ -7,8 +7,7 @@ limits, response caching, retries, and per-upstream circuit breakers.
 The executable is called `llmgate`. Redis enables shared rate limiting and
 response caching; the gateway also runs without Redis using an in-memory limiter.
 
-**Licensing status:** this repository does not currently include a `LICENSE`
-file. A license needs to be selected before the project is released as open source.
+Open source under the [MIT License](LICENSE).
 
 ## Contents
 
@@ -27,6 +26,7 @@ file. A license needs to be selected before the project is released as open sour
 - [Development and automated tests](#development-and-automated-tests)
 - [Troubleshooting](#troubleshooting)
 - [Contributing](#contributing)
+- [License](#license)
 
 ## Features
 
@@ -642,4 +642,8 @@ For a contribution:
 5. Update this README when configuration or public behavior changes.
 6. Open a pull request with the problem, change, and validation results.
 
-Licensing is pending until a `LICENSE` file is added.
+## License
+
+Licensed under the [MIT License](LICENSE).
+
+Copyright (c) 2026 Aakash Yadav.
